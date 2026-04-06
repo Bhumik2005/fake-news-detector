@@ -54,6 +54,7 @@ fake-news-detector/
 4. Balanced dataset for improved performance
 
 🚀 How to Run Locally
+
 1️⃣ Clone the repository
 ```
 git clone https://github.com/your-username/fake-news-detector.git
