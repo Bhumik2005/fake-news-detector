@@ -3,6 +3,7 @@ from pydantic import BaseModel
 import joblib
 import requests
 import os
+import feedparser
 from sklearn.metrics.pairwise import cosine_similarity
 
 app = FastAPI()
@@ -26,39 +27,34 @@ def clean_query(text):
 
 
 # 🔎 Fetch live news (IMPROVED)
+def clean_query(text):
+    words = text.lower().replace("?", "").split()
+    return " ".join(words[:6])
+
 def fetch_related_news(query):
     try:
-        url = "https://newsapi.org/v2/everything"
+        # Convert query to URL format
+        query = query.replace(" ", "+")
 
-        params = {
-            "q": clean_query(query),
-            "language": "en",
-            "sortBy": "publishedAt",
-            "pageSize": 10,
-            "apiKey": NEWS_API_KEY
-        }
+        url = f"https://news.google.com/rss/search?q={query}&hl=en-IN&gl=IN&ceid=IN:en"
 
-        res = requests.get(url, params=params)
-        data = res.json()
-
-        print("NEWS API RESPONSE:", data)  # 🔥 DEBUG
+        feed = feedparser.parse(url)
 
         articles = []
 
-        if "articles" in data:
-            for a in data["articles"]:
-                articles.append({
-                    "title": a.get("title", ""),
-                    "description": a.get("description", ""),
-                    "url": a.get("url", ""),
-                    "source": a["source"].get("name", "Unknown"),
-                    "publishedAt": a.get("publishedAt", "")
-                })
+        for entry in feed.entries[:5]:
+            articles.append({
+                "title": entry.title,
+                "description": entry.get("summary", ""),
+                "url": entry.link,
+                "source": entry.get("source", {}).get("title", "Google News"),
+                "publishedAt": entry.get("published", "")
+            })
 
-        return articles[:5]
+        return articles
 
     except Exception as e:
-        print("ERROR FETCHING NEWS:", str(e))
+        print("GOOGLE NEWS ERROR:", str(e))
         return []
 
 
@@ -92,7 +88,7 @@ def predict(news: NewsInput):
     probs = model.predict_proba(vec)[0]
 
     # Fetch news
-    articles = fetch_related_news(text)
+    articles = fetch_related_news(clean_query(text))
 
     # Similarity
     similarity = compute_similarity(text, articles)
