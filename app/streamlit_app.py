@@ -1,70 +1,70 @@
 import streamlit as st
 import requests
 
-# 🔥 IMPORTANT: USE YOUR DEPLOYED API URL HERE
+# 🔥 IMPORTANT: PUT YOUR DEPLOYED BACKEND URL HERE
 API_URL = "https://fake-news-detector-1-lc2z.onrender.com/predict"
 
 # Page config
-st.set_page_config(page_title="Fake News Detector", layout="centered")
+st.set_page_config(
+    page_title="Fake News Detector",
+    layout="centered"
+)
 
 # Title
-st.title("📰 Fake News Detector")
-st.write("Enter a news article or question to verify its authenticity.")
+st.title("📰 Real-Time Fake News Detector")
+st.write("Enter a news statement or question to verify it using live news sources.")
 
-# Input
-text = st.text_area("Enter News Article", height=200)
+# Input box
+text = st.text_area("Enter News / Question", height=200)
 
-# Button
+# Predict button
 if st.button("Predict"):
 
+    # Empty input check
     if text.strip() == "":
         st.warning("⚠️ Please enter some text!")
 
     else:
-        if len(text.split()) < 5:
-            st.warning("⚠️ Try entering a longer sentence for better results")
 
         try:
+            # 🔎 API CALL
             response = requests.post(
-                API_URL,
+                "https://fake-news-detector-1-lc2z.onrender.com/predict",
                 json={"text": text}
             )
+
+            # Debug (optional – remove later)
+            # st.write(response.status_code)
+            # st.write(response.text)
 
             if response.status_code == 200:
                 data = response.json()
 
-                if "error" in data:
-                    st.error(data["error"])
+                # Safety check
+                if "prediction" not in data:
+                    st.error("❌ Invalid response from API")
+                    st.write(data)
+
                 else:
                     # 🔥 RESULT
                     st.subheader("Result")
 
                     if data["prediction"] == "Real":
-                        st.success("✅ Real News")
-                    elif data["prediction"] == "Fake":
-                        st.error("❌ Fake News")
+                        st.success("✅ Verified News")
+                    elif data["prediction"] == "Likely Fake":
+                        st.error("❌ Likely Fake News")
                     else:
-                        st.warning("⚠️ Uncertain")
+                        st.warning("⚠️ Unverified / Developing Story")
 
-                    # 🔥 REASON
-                    st.subheader("Why this result?")
-                    st.info(data["reason"])
+                    # 🔥 MATCH PERCENTAGE
+                    st.subheader("Match with Real News")
+                    match = data.get("match_percentage", 0)
+                    st.progress(int(match))
+                    st.caption(f"{match:.1f}% similarity with live news")
 
-                    # 🔥 CONFIDENCE
-                    st.subheader("Model Confidence")
-
-                    st.write("Real News Confidence")
-                    st.progress(int(data["confidence_real"] * 100))
-                    st.caption(f"{data['confidence_real']*100:.1f}%")
-
-                    st.write("Fake News Confidence")
-                    st.progress(int(data["confidence_fake"] * 100))
-                    st.caption(f"{data['confidence_fake']*100:.1f}%")
-
-                    # 🔥 SIMILARITY
-                    st.subheader("Similarity with live news")
-                    st.progress(int(data["similarity_score"] * 100))
-                    st.caption(f"{data['similarity_score']*100:.1f}% match")
+                    # 🔥 EXPLANATION
+                    st.subheader("Explanation")
+                    st.info(data.get("reason", "No explanation available"))
 
                     # 🔥 RELATED ARTICLES
                     st.subheader("📰 Related News Articles")
@@ -73,15 +73,21 @@ if st.button("Predict"):
 
                     if articles:
                         for article in articles:
-                            st.markdown(f"**{article['title']}**")
+                            st.markdown(f"### {article['title']}")
                             st.write(f"Source: {article['source']}")
-                            st.markdown(f"[Read more]({article['url']})")
+                            
+                            # Published date (if available)
+                            if "publishedAt" in article:
+                                st.caption(f"Published: {article['publishedAt']}")
+
+                            st.markdown(f"[Read full article]({article['url']})")
                             st.write("---")
                     else:
-                        st.write("No related news found.")
+                        st.write("No relevant news articles found.")
 
             else:
-                st.error("❌ API Error")
+                st.error(f"❌ API Error: {response.status_code}")
+                st.write(response.text)
 
         except Exception as e:
             st.error("❌ Could not connect to backend")

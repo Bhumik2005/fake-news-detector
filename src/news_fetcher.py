@@ -1,34 +1,100 @@
+import streamlit as st
 import requests
-import os
 
-API_KEY = os.getenv("NEWS_API_KEY = e43e423d76214d629ce59e7441755647")
+# 🔥 IMPORTANT: PUT YOUR DEPLOYED BACKEND URL HERE
+API_URL = "https://fake-news-detector-1-lc2z.onrender.com/predict"
 
-def fetch_news(query):
-    url = "https://newsapi.org/v2/everything"
-    
-    params = {
-        "q": query,
-        "apiKey": API_KEY,
-        "language": "en",
-        "sortBy": "relevancy",
-        "pageSize": 5
-    }
+# Page config
+st.set_page_config(
+    page_title="Fake News Detector",
+    layout="centered"
+)
 
-    response = requests.get(url, params=params)
+# Title
+st.title("📰 Real-Time Fake News Detector")
+st.write("Enter a news statement or question to verify it using live news sources.")
 
-    if response.status_code != 200:
-        return []
+# Input box
+text = st.text_area("Enter News / Question", height=200)
 
-    data = response.json()
-    articles = data.get("articles", [])
+# Predict button
+if st.button("Predict"):
 
-    results = []
+    # Empty input check
+    if text.strip() == "":
+        st.warning("⚠️ Please enter some text!")
 
-    for article in articles:
-        results.append({
-            "title": article["title"],
-            "source": article["source"]["name"],
-            "url": article["url"]
-        })
+    else:
+        # Short input warning
+        if len(text.split()) < 5:
+            st.warning("⚠️ Try entering a longer sentence for better accuracy")
 
-    return results
+        try:
+            # 🔎 API CALL
+            response = requests.post(
+                API_URL,
+                json={"text": text}
+            )
+
+            # Debug (optional – remove later)
+            # st.write(response.status_code)
+            # st.write(response.text)
+
+            if response.status_code == 200:
+                data = response.json()
+
+                # Safety check
+                if "prediction" not in data:
+                    st.error("❌ Invalid response from API")
+                    st.write(data)
+
+                else:
+                    # 🔥 RESULT
+                    st.subheader("Result")
+
+                    if data["prediction"] == "Real":
+                        st.success("✅ Verified News")
+                    elif data["prediction"] == "Likely Fake":
+                        st.error("❌ Likely Fake News")
+                    else:
+                        st.warning("⚠️ Unverified / Developing Story")
+
+                    # 🔥 MATCH PERCENTAGE
+                    st.subheader("Match with Real News")
+                    match = data.get("match_percentage", 0)
+                    st.progress(int(match))
+                    st.caption(f"{match:.1f}% similarity with live news")
+
+                    # 🔥 EXPLANATION
+                    st.subheader("Explanation")
+                    st.info(data.get("reason", "No explanation available"))
+
+                    # 🔥 RELATED ARTICLES
+                    st.subheader("📰 Related News Articles")
+
+                    articles = data.get("related_articles", [])
+
+                    if articles:
+                        for article in articles:
+                            st.markdown(f"### {article['title']}")
+                            st.write(f"Source: {article['source']}")
+                            
+                            # Published date (if available)
+                            if "publishedAt" in article:
+                                st.caption(f"Published: {article['publishedAt']}")
+
+                            st.markdown(f"[Read full article]({article['url']})")
+                            st.write("---")
+                    else:
+                        st.write("No relevant news articles found.")
+
+            else:
+                st.error(f"❌ API Error: {response.status_code}")
+                st.write(response.text)
+
+        except Exception as e:
+            st.error("❌ Could not connect to backend")
+            st.write(str(e))
+print("API KEY:", NEWS_API_KEY)
+print("QUERY:", query)
+print("RESPONSE:", data)

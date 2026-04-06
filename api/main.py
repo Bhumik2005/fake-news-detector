@@ -2,36 +2,64 @@ from fastapi import FastAPI
 from pydantic import BaseModel
 import joblib
 import requests
+import os
 from sklearn.metrics.pairwise import cosine_similarity
 
 app = FastAPI()
 
-# Load model and vectorizer
+# Load model
 model = joblib.load("models/model.pkl")
 vectorizer = joblib.load("models/vectorizer.pkl")
 
-# 🔑 PUT YOUR API KEY HERE
-NEWS_API_KEY = "e43e423d76214d629ce59e7441755647"
+# 🔐 Secure API key
+NEWS_API_KEY = os.getenv("NEWS_API_KEY")
+
 
 class NewsInput(BaseModel):
     text: str
 
 
-# 🔎 Fetch live news
-def fetch_related_news(query):
-    url = f"https://newsapi.org/v2/everything?q={query}&apiKey={NEWS_API_KEY}"
-    res = requests.get(url).json()
+# 🔧 Clean query for better search
+def clean_query(text):
+    words = text.split()
+    return " ".join(words[:6])  # take first 5–6 words
 
-    articles = []
-    if "articles" in res:
-        for a in res["articles"][:5]:
-            articles.append({
-                "title": a["title"],
-                "description": a["description"] or "",
-                "url": a["url"],
-                "source": a["source"]["name"]
-            })
-    return articles
+
+# 🔎 Fetch live news (IMPROVED)
+def fetch_related_news(query):
+    try:
+        url = "https://newsapi.org/v2/everything"
+
+        params = {
+            "q": clean_query(query),
+            "language": "en",
+            "sortBy": "publishedAt",
+            "pageSize": 10,
+            "apiKey": NEWS_API_KEY
+        }
+
+        res = requests.get(url, params=params)
+        data = res.json()
+
+        print("NEWS API RESPONSE:", data)  # 🔥 DEBUG
+
+        articles = []
+
+        if "articles" in data:
+            for a in data["articles"]:
+                articles.append({
+                    "title": a.get("title", ""),
+                    "description": a.get("description", ""),
+                    "url": a.get("url", ""),
+                    "source": a["source"].get("name", "Unknown"),
+                    "publishedAt": a.get("publishedAt", "")
+                })
+
+        return articles[:5]
+
+    except Exception as e:
+        print("ERROR FETCHING NEWS:", str(e))
+        return []
 
 
 # 🧠 Similarity check
@@ -40,61 +68,55 @@ def compute_similarity(user_text, articles):
         return 0.0
 
     texts = [user_text] + [
-        (a["title"] or "") + " " + (a["description"] or "")
+        a["title"] + " " + a["description"]
         for a in articles
     ]
 
     vectors = vectorizer.transform(texts)
 
-    user_vec = vectors[0]
-    news_vecs = vectors[1:]
-
-    sims = cosine_similarity(user_vec, news_vecs)
+    sims = cosine_similarity(vectors[0], vectors[1:])
     return float(max(sims[0]))
 
 
-# 🚀 MAIN PREDICTION API
+# 🚀 MAIN API
 @app.post("/predict")
 def predict(news: NewsInput):
     text = news.text.strip()
 
-    # Handle empty input
     if not text:
         return {"error": "Empty input"}
 
-    # STEP 1: Detect question
-    is_question = (
-        "?" in text or
-        text.lower().startswith(("is", "are", "was", "were", "did", "does"))
-    )
-
-    # STEP 2: ML prediction
+    # ML prediction
     vec = vectorizer.transform([text])
-    pred = model.predict(vec)[0]  # 0 = Fake, 1 = Real
+    pred = model.predict(vec)[0]
     probs = model.predict_proba(vec)[0]
 
-    # STEP 3: Fetch live news
+    # Fetch news
     articles = fetch_related_news(text)
 
-    # STEP 4: Similarity score
+    # Similarity
     similarity = compute_similarity(text, articles)
 
-    # STEP 5: FINAL DECISION LOGIC 🔥
-    if similarity > 0.5:
+    # 🔥 FINAL DECISION (IMPROVED)
+    if similarity > 0.6:
         final = "Real"
-        reason = "Matched with real news articles"
-    elif similarity < 0.2 and pred == 0:
-        final = "Fake"
-        reason = "No matching news + model prediction"
+        reason = "Strong match with latest news"
+
+    elif similarity > 0.3:
+        final = "Unverified"
+        reason = "Partial match with current news"
+
     else:
-        final = "Uncertain"
-        reason = "Not enough reliable information"
+        if articles:
+            final = "Likely Fake"
+            reason = "No strong match in news sources"
+        else:
+            final = "Unverified"
+            reason = "No recent news found"
 
     return {
         "prediction": final,
-        "confidence_real": float(probs[1]),
-        "confidence_fake": float(probs[0]),
-        "similarity_score": similarity,
+        "match_percentage": round(similarity * 100, 2),
         "reason": reason,
         "related_articles": articles
     }
