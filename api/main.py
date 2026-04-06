@@ -1,9 +1,10 @@
-from fastapi import FastAPI
-from pydantic import BaseModel
 import joblib
 import requests
 import os
 import feedparser
+import re
+from fastapi import FastAPI
+from pydantic import BaseModel
 from sklearn.metrics.pairwise import cosine_similarity
 
 app = FastAPI()
@@ -59,19 +60,39 @@ def fetch_related_news(query):
 
 
 # 🧠 Similarity check
+def boost_for_questions(text, similarity):
+    if "?" in text.lower():
+        return similarity + 0.1
+    return similarity
+similarity = compute_similarity(text, articles)
+similarity = boost_for_questions(text, similarity)
+
 def compute_similarity(user_text, articles):
     if not articles:
         return 0.0
 
-    texts = [user_text] + [
-        a["title"] + " " + a["description"]
-        for a in articles
-    ]
+    user_words = set(re.findall(r"\w+", user_text.lower()))
 
-    vectors = vectorizer.transform(texts)
+    scores = []
 
-    sims = cosine_similarity(vectors[0], vectors[1:])
-    return float(max(sims[0]))
+    for article in articles:
+        article_text = (article["title"] + " " + article["description"]).lower()
+        article_words = set(re.findall(r"\w+", article_text))
+
+        # 🔹 Keyword overlap score
+        common_words = user_words.intersection(article_words)
+        keyword_score = len(common_words) / (len(user_words) + 1)
+
+        # 🔹 ML cosine similarity
+        vecs = vectorizer.transform([user_text, article_text])
+        ml_score = cosine_similarity(vecs[0], vecs[1])[0][0]
+
+        # 🔥 FINAL HYBRID SCORE
+        final_score = (0.6 * keyword_score) + (0.4 * ml_score)
+
+        scores.append(final_score)
+
+    return max(scores)
 
 
 # 🚀 MAIN API
