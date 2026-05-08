@@ -1,130 +1,236 @@
-import joblib
-import os
-import feedparser
 import re
-from fastapi import FastAPI
-from pydantic import BaseModel
+import logging
+import joblib
+import feedparser
+from fastapi import FastAPI, HTTPException
+from pydantic import BaseModel, validator
 from sklearn.metrics.pairwise import cosine_similarity
 
-app = FastAPI()
+# ─── Logging ────────────────────────────────────────────────────────────────
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)s | %(message)s"
+)
+logger = logging.getLogger(__name__)
 
-# Load model
-model = joblib.load("models/model.pkl")
-vectorizer = joblib.load("models/vectorizer.pkl")
+app = FastAPI(title="Fake News Detector API", version="2.0")
+
+# ─── Load model ─────────────────────────────────────────────────────────────
+try:
+    model = joblib.load("models/model.pkl")
+    vectorizer = joblib.load("models/vectorizer.pkl")
+    logger.info("Model and vectorizer loaded successfully.")
+except Exception as e:
+    logger.error(f"Failed to load model: {e}")
+    raise
 
 
+# ─── Schema ──────────────────────────────────────────────────────────────────
 class NewsInput(BaseModel):
     text: str
 
+    @validator("text")
+    def text_must_not_be_empty(cls, v):
+        if not v.strip():
+            raise ValueError("Input text cannot be empty.")
+        return v.strip()
 
-# 🔧 Clean query
-def clean_query(text):
-    words = text.lower().replace("?", "").split()
+
+# ─── Preprocessing ───────────────────────────────────────────────────────────
+def preprocess(text: str) -> str:
+    """Lowercase, remove URLs, strip special chars — must match train.py pipeline."""
+    text = text.lower()
+    text = re.sub(r"http\S+|www\S+", "", text)        # remove URLs
+    text = re.sub(r"[^a-z0-9\s]", " ", text)          # remove special chars
+    text = re.sub(r"\s+", " ", text).strip()           # collapse whitespace
+    return text
+
+
+# ─── News fetching ───────────────────────────────────────────────────────────
+def clean_query(text: str) -> str:
+    """Extract a short keyword query from raw input."""
+    words = re.sub(r"[^a-z0-9\s]", "", text.lower()).split()
     return " ".join(words[:6])
 
 
-# 🔎 Google News fetch
-def fetch_related_news(query):
+def fetch_related_news(query: str) -> list:
     try:
-        query = query.replace(" ", "+")
-        url = f"https://news.google.com/rss/search?q={query}&hl=en-IN&gl=IN&ceid=IN:en"
-
+        query_encoded = query.replace(" ", "+")
+        url = (
+            f"https://news.google.com/rss/search"
+            f"?q={query_encoded}&hl=en-IN&gl=IN&ceid=IN:en"
+        )
         feed = feedparser.parse(url)
-
         articles = []
-
         for entry in feed.entries[:5]:
             articles.append({
                 "title": entry.title,
                 "description": entry.get("summary", ""),
                 "url": entry.link,
                 "source": entry.get("source", {}).get("title", "Google News"),
-                "publishedAt": entry.get("published", "")
+                "publishedAt": entry.get("published", ""),
             })
-
+        logger.info(f"Fetched {len(articles)} articles for query: '{query}'")
         return articles
-
     except Exception as e:
-        print("GOOGLE NEWS ERROR:", str(e))
+        logger.warning(f"News fetch failed: {e}")
         return []
 
 
-# 🧠 Hybrid similarity
-def compute_similarity(user_text, articles):
+# ─── Similarity ──────────────────────────────────────────────────────────────
+def compute_best_similarity(user_text: str, articles: list) -> tuple[float, dict | None]:
+    """
+    Returns (best_score, best_article).
+    Hybrid: 60% keyword overlap + 40% TF-IDF cosine similarity.
+    """
     if not articles:
-        return 0.0
+        return 0.0, None
 
-    user_words = set(re.findall(r"\w+", user_text.lower()))
-    scores = []
+    user_clean = preprocess(user_text)
+    user_words = set(re.findall(r"\w+", user_clean))
+    best_score = 0.0
+    best_article = None
 
     for article in articles:
-        article_text = (article["title"] + " " + article["description"]).lower()
+        article_text = preprocess(
+            article["title"] + " " + article["description"]
+        )
         article_words = set(re.findall(r"\w+", article_text))
 
-        # Keyword overlap
-        common_words = user_words.intersection(article_words)
-        keyword_score = len(common_words) / (len(user_words) + 1)
+        # Keyword overlap score
+        common = user_words.intersection(article_words)
+        keyword_score = len(common) / (len(user_words) + 1e-9)
 
-        # ML similarity
-        vecs = vectorizer.transform([user_text, article_text])
-        ml_score = cosine_similarity(vecs[0], vecs[1])[0][0]
+        # TF-IDF cosine similarity
+        vecs = vectorizer.transform([user_clean, article_text])
+        ml_score = float(cosine_similarity(vecs[0], vecs[1])[0][0])
 
-        # Final hybrid score
-        final_score = (0.6 * keyword_score) + (0.4 * ml_score)
-        scores.append(final_score)
+        score = 0.6 * keyword_score + 0.4 * ml_score
 
-    return max(scores)
+        if score > best_score:
+            best_score = score
+            best_article = article
 
-
-# 🔥 Boost for questions
-def boost_for_questions(text, similarity):
-    if "?" in text.lower():
-        return min(similarity + 0.1, 1.0)
-    return similarity
+    return best_score, best_article
 
 
-# 🚀 MAIN API
+# ─── Fusion logic ────────────────────────────────────────────────────────────
+def fuse_verdict(
+    ml_label: int,
+    ml_fake_prob: float,
+    ml_real_prob: float,
+    similarity: float,
+    has_news: bool,
+) -> tuple[str, str, float]:
+    """
+    Combine ML model prediction + news similarity into one final verdict.
+
+    Weights:
+      - ML confidence contributes 50%
+      - News similarity contributes 50%
+
+    Returns: (verdict, reason, final_confidence)
+    """
+    # ML signal: score from 0 (very fake) to 1 (very real)
+    ml_signal = ml_real_prob  # already a probability
+
+    # News signal: normalise similarity to [0, 1]
+    news_signal = min(similarity, 1.0)
+
+    if not has_news:
+        # No news found — rely entirely on ML
+        combined = ml_signal
+        weight_note = "based on model only (no news found)"
+    else:
+        # Weighted fusion
+        combined = 0.5 * ml_signal + 0.5 * news_signal
+        weight_note = "model + news verification"
+
+    # ── Verdict thresholds ────────────────────────────────────────────────────
+    if combined >= 0.65:
+        verdict = "Real"
+        reason = f"Verified by {weight_note}: strong evidence this is real."
+    elif combined >= 0.40:
+        verdict = "Unverified"
+        reason = f"Mixed signals from {weight_note}. Treat with caution."
+    else:
+        verdict = "Likely Fake"
+        reason = f"Low credibility score from {weight_note}."
+
+    # Override: if ML is very confident fake AND similarity is low → Fake
+    if ml_fake_prob > 0.80 and similarity < 0.25:
+        verdict = "Likely Fake"
+        reason = "Model is highly confident this is fake, and no news evidence found."
+
+    # Override: if ML is very confident real AND strong news match → Real
+    if ml_real_prob > 0.80 and similarity > 0.55:
+        verdict = "Real"
+        reason = "Model is highly confident, strongly corroborated by current news."
+
+    return verdict, reason, round(combined * 100, 2)
+
+
+# ─── Main endpoint ───────────────────────────────────────────────────────────
 @app.post("/predict")
 def predict(news: NewsInput):
-    text = news.text.strip()
+    text = news.text  # already validated + stripped by Pydantic
 
-    if not text:
-        return {"error": "Empty input"}
+    # Short input warning
+    word_count = len(text.split())
+    if word_count < 5:
+        return {
+            "warning": "Input too short for reliable prediction.",
+            "word_count": word_count,
+        }
 
-    # ML prediction
-    vec = vectorizer.transform([text])
-    pred = model.predict(vec)[0]
+    # ── ML prediction ─────────────────────────────────────────────────────────
+    clean = preprocess(text)
+    vec = vectorizer.transform([clean])
+    ml_label = int(model.predict(vec)[0])
     probs = model.predict_proba(vec)[0]
+    ml_fake_prob = float(probs[0])
+    ml_real_prob = float(probs[1])
 
-    # Fetch news
-    articles = fetch_related_news(clean_query(text))
+    logger.info(
+        f"ML → label={ml_label} | fake={ml_fake_prob:.2f} | real={ml_real_prob:.2f}"
+    )
 
-    # Similarity
-    similarity = compute_similarity(text, articles)
+    # ── News verification ─────────────────────────────────────────────────────
+    query = clean_query(text)
+    articles = fetch_related_news(query)
+    similarity, best_article = compute_best_similarity(text, articles)
 
-    # 🔥 Apply boost
-    similarity = boost_for_questions(text, similarity)
+    logger.info(f"News similarity={similarity:.3f} | articles={len(articles)}")
 
-    # Decision logic
-    if similarity > 0.6:
-        final = "Real"
-        reason = "Strong match with latest news"
+    # ── Fuse both signals ─────────────────────────────────────────────────────
+    verdict, reason, confidence = fuse_verdict(
+        ml_label=ml_label,
+        ml_fake_prob=ml_fake_prob,
+        ml_real_prob=ml_real_prob,
+        similarity=similarity,
+        has_news=len(articles) > 0,
+    )
 
-    elif similarity > 0.3:
-        final = "Unverified"
-        reason = "Partial match with current news"
-
-    else:
-        if articles:
-            final = "Likely Fake"
-            reason = "No strong match in news sources"
-        else:
-            final = "Unverified"
-            reason = "No recent news found"
+    logger.info(f"Final verdict={verdict} | confidence={confidence}")
 
     return {
-        "prediction": final,
-        "match_percentage": round(similarity * 100, 2),
+        "prediction": verdict,
+        "confidence_score": confidence,
         "reason": reason,
-        "related_articles": articles
+        "ml_details": {
+            "label": "Real" if ml_label == 1 else "Fake",
+            "fake_probability": round(ml_fake_prob * 100, 2),
+            "real_probability": round(ml_real_prob * 100, 2),
+        },
+        "news_details": {
+            "similarity_score": round(similarity * 100, 2),
+            "articles_found": len(articles),
+        },
+        "best_match": best_article,
+        "related_articles": articles,
     }
+
+
+@app.get("/health")
+def health():
+    return {"status": "ok", "model_loaded": True}
