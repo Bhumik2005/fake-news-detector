@@ -1,0 +1,15 @@
+{
+  "test_accuracy": 0.9881,
+  "roc_auc": 0.9989,
+  "cv_mean_accuracy": 0.9882,
+  "cv_std_accuracy": 0.0017,
+  "cv_fold_scores": [
+    0.9911,
+    0.9883,
+    0.9885,
+    0.9872,
+    0.9858
+  ],
+  "train_size": 34267,
+  "test_size": 8567
+}

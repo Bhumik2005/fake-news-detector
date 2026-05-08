@@ -36,6 +36,10 @@ if st.button("Predict"):
             if response.status_code == 200:
                 data = response.json()
 
+                if "warning" in data:
+                    st.warning(f"⚠️ {data['warning']}")
+                    st.stop()
+
                 if "prediction" not in data:
                     st.error("❌ Invalid response from API")
                     st.write(data)

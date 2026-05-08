@@ -20,219 +20,126 @@ from sklearn.metrics import (
 )
 from sklearn.pipeline import Pipeline
 
-
-# ─── Logging ─────────────────────────────────────────────────────────────────
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s | %(levelname)s | %(message)s"
-)
+logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
 logger = logging.getLogger(__name__)
 
-app = FastAPI(title="Fake News Detector API", version="3.0")
+os.makedirs("models", exist_ok=True)
+os.makedirs("reports", exist_ok=True)
 
-# ─── Load pipeline (vectorizer + model in one object) ────────────────────────
-try:
-    pipeline = joblib.load("models/pipeline.pkl")
-    logger.info("Pipeline loaded successfully.")
-except Exception as e:
-    logger.error(f"Failed to load pipeline: {e}")
-    raise
-
-
-# ─── Schemas ─────────────────────────────────────────────────────────────────
-class NewsInput(BaseModel):
-    text: str
-
-    @validator("text")
-    def not_empty(cls, v):
-        if not v.strip():
-            raise ValueError("Input text cannot be empty.")
-        return v.strip()
-
-
-class ExplainInput(BaseModel):
-    text: str
-    use_lime: bool = True      # set False to use fast TF-IDF fallback
-
-    @validator("text")
-    def not_empty(cls, v):
-        if not v.strip():
-            raise ValueError("Input text cannot be empty.")
-        return v.strip()
-
-
-# ─── Preprocessing ────────────────────────────────────────────────────────────
 def preprocess(text: str) -> str:
-    """Must stay in sync with src/train.py preprocess()."""
+    if not isinstance(text, str):
+        return ""
     text = text.lower()
     text = re.sub(r"http\S+|www\S+", "", text)
     text = re.sub(r"[^a-z0-9\s]", " ", text)
     text = re.sub(r"\s+", " ", text).strip()
     return text
 
+logger.info("Loading datasets...")
+fake = pd.read_csv("data/fake.csv", low_memory=False)
+true = pd.read_csv("data/true.csv", low_memory=False)
 
-# ─── News helpers ─────────────────────────────────────────────────────────────
-def clean_query(text: str) -> str:
-    words = re.sub(r"[^a-z0-9\s]", "", text.lower()).split()
-    return " ".join(words[:6])
+fake["label"] = 0
+true["label"] = 1
 
+df = pd.concat([fake, true], ignore_index=True)
+df = df.sample(frac=1, random_state=42).reset_index(drop=True)
 
-def fetch_related_news(query: str) -> list:
-    try:
-        url = (
-            f"https://news.google.com/rss/search"
-            f"?q={query.replace(' ', '+')}&hl=en-IN&gl=IN&ceid=IN:en"
-        )
-        feed = feedparser.parse(url)
-        articles = []
-        for entry in feed.entries[:5]:
-            articles.append({
-                "title": entry.title,
-                "description": entry.get("summary", ""),
-                "url": entry.link,
-                "source": entry.get("source", {}).get("title", "Google News"),
-                "publishedAt": entry.get("published", ""),
-            })
-        logger.info(f"Fetched {len(articles)} articles for: '{query}'")
-        return articles
-    except Exception as e:
-        logger.warning(f"News fetch failed: {e}")
-        return []
+min_count = df["label"].value_counts().min()
+df = df.groupby("label").sample(min_count, random_state=42).reset_index(drop=True)
+logger.info(f"Balanced class distribution:\n{df['label'].value_counts().to_string()}")
 
+df["content"] = (
+    df.get("title", pd.Series([""] * len(df))).fillna("")
+    + " "
+    + df["text"].fillna("")
+)
 
-def compute_best_similarity(user_text: str, articles: list) -> tuple:
-    if not articles:
-        return 0.0, None
+logger.info("Preprocessing text...")
+df["content"] = df["content"].apply(preprocess)
 
-    user_clean = preprocess(user_text)
-    user_words = set(re.findall(r"\w+", user_clean))
-    best_score, best_article = 0.0, None
+X = df["content"]
+y = df["label"]
 
-    for article in articles:
-        article_text = preprocess(article["title"] + " " + article["description"])
-        article_words = set(re.findall(r"\w+", article_text))
+X_train, X_test, y_train, y_test = train_test_split(
+    X, y, test_size=0.2, random_state=42, stratify=y
+)
+logger.info(f"Train size: {len(X_train)} | Test size: {len(X_test)}")
 
-        keyword_score = len(user_words & article_words) / (len(user_words) + 1e-9)
+pipeline = Pipeline([
+    ("tfidf", TfidfVectorizer(
+        stop_words="english",
+        max_features=20000,
+        ngram_range=(1, 3),
+        sublinear_tf=True,
+        min_df=3,
+    )),
+    ("clf", SGDClassifier(
+        loss="log_loss",
+        max_iter=100,
+        random_state=42,
+        n_jobs=-1,
+    )),
+])
 
-        vecs = pipeline.named_steps["tfidf"].transform([user_clean, article_text])
-        ml_score = float(cosine_similarity(vecs[0], vecs[1])[0][0])
+logger.info("Running 5-fold cross-validation...")
+cv = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
+cv_scores = cross_val_score(pipeline, X_train, y_train, cv=cv, scoring="accuracy", n_jobs=-1)
+logger.info(f"CV Accuracy: {cv_scores.mean():.4f} ± {cv_scores.std():.4f}")
 
-        score = 0.6 * keyword_score + 0.4 * ml_score
-        if score > best_score:
-            best_score, best_article = score, article
+logger.info("Training final model...")
+pipeline.fit(X_train, y_train)
 
-    return best_score, best_article
+y_pred = pipeline.predict(X_test)
+y_proba = pipeline.predict_proba(X_test)[:, 1]
 
+test_accuracy = accuracy_score(y_test, y_pred)
+roc_auc = roc_auc_score(y_test, y_proba)
 
-def fuse_verdict(ml_label, ml_fake_prob, ml_real_prob, similarity, has_news):
-    ml_signal = ml_real_prob
-    news_signal = min(similarity, 1.0)
+logger.info(f"Test Accuracy: {test_accuracy:.4f}")
+logger.info(f"ROC-AUC: {roc_auc:.4f}")
+print("\nClassification Report:\n")
+print(classification_report(y_test, y_pred, target_names=["Fake", "Real"]))
 
-    combined = ml_signal if not has_news else 0.5 * ml_signal + 0.5 * news_signal
-    weight_note = "model only (no news)" if not has_news else "model + news"
+cm = confusion_matrix(y_test, y_pred)
+disp = ConfusionMatrixDisplay(confusion_matrix=cm, display_labels=["Fake", "Real"])
+fig, ax = plt.subplots(figsize=(6, 5))
+disp.plot(ax=ax, colorbar=False, cmap="Blues")
+ax.set_title("Confusion Matrix — Fake News Detector", fontsize=13)
+plt.tight_layout()
+plt.savefig("reports/confusion_matrix.png", dpi=150)
+plt.close()
 
-    if combined >= 0.65:
-        verdict, reason = "Real", f"Strong credibility from {weight_note}."
-    elif combined >= 0.40:
-        verdict, reason = "Unverified", f"Mixed signals from {weight_note}."
-    else:
-        verdict, reason = "Likely Fake", f"Low credibility from {weight_note}."
+fpr, tpr, _ = roc_curve(y_test, y_proba)
+fig, ax = plt.subplots(figsize=(6, 5))
+ax.plot(fpr, tpr, color="steelblue", lw=2, label=f"AUC = {roc_auc:.4f}")
+ax.plot([0, 1], [0, 1], "k--", lw=1, alpha=0.5)
+ax.set_xlabel("False Positive Rate")
+ax.set_ylabel("True Positive Rate")
+ax.set_title("ROC Curve — Fake News Detector", fontsize=13)
+ax.legend(loc="lower right")
+plt.tight_layout()
+plt.savefig("reports/roc_curve.png", dpi=150)
+plt.close()
 
-    if ml_fake_prob > 0.80 and similarity < 0.25:
-        verdict = "Likely Fake"
-        reason = "Model highly confident fake; no corroborating news found."
-    if ml_real_prob > 0.80 and similarity > 0.55:
-        verdict = "Real"
-        reason = "Model highly confident real; strongly corroborated by news."
+metrics = {
+    "test_accuracy": round(test_accuracy, 4),
+    "roc_auc": round(roc_auc, 4),
+    "cv_mean_accuracy": round(float(cv_scores.mean()), 4),
+    "cv_std_accuracy": round(float(cv_scores.std()), 4),
+    "cv_fold_scores": [round(s, 4) for s in cv_scores.tolist()],
+    "train_size": len(X_train),
+    "test_size": len(X_test),
+}
+with open("reports/metrics.json", "w") as f:
+    json.dump(metrics, f, indent=2)
 
-    return verdict, reason, round(combined * 100, 2)
+joblib.dump(pipeline, "models/pipeline.pkl")
+joblib.dump(pipeline.named_steps["clf"], "models/model.pkl")
+joblib.dump(pipeline.named_steps["tfidf"], "models/vectorizer.pkl")
 
-
-# ─── /predict ────────────────────────────────────────────────────────────────
-@app.post("/predict")
-def predict(news: NewsInput):
-    text = news.text
-
-    if len(text.split()) < 5:
-        return {"warning": "Input too short for reliable prediction."}
-
-    clean = preprocess(text)
-    ml_label = int(pipeline.predict([clean])[0])
-    probs = pipeline.predict_proba([clean])[0]
-    ml_fake_prob, ml_real_prob = float(probs[0]), float(probs[1])
-
-    logger.info(f"ML → label={ml_label} fake={ml_fake_prob:.2f} real={ml_real_prob:.2f}")
-
-    articles = fetch_related_news(clean_query(text))
-    similarity, best_article = compute_best_similarity(text, articles)
-
-    logger.info(f"Similarity={similarity:.3f} articles={len(articles)}")
-
-    verdict, reason, confidence = fuse_verdict(
-        ml_label, ml_fake_prob, ml_real_prob, similarity, len(articles) > 0
-    )
-
-    logger.info(f"Verdict={verdict} confidence={confidence}")
-
-    return {
-        "prediction": verdict,
-        "confidence_score": confidence,
-        "reason": reason,
-        "ml_details": {
-            "label": "Real" if ml_label == 1 else "Fake",
-            "fake_probability": round(ml_fake_prob * 100, 2),
-            "real_probability": round(ml_real_prob * 100, 2),
-        },
-        "news_details": {
-            "similarity_score": round(similarity * 100, 2),
-            "articles_found": len(articles),
-        },
-        "best_match": best_article,
-        "related_articles": articles,
-    }
-
-
-# ─── /explain ────────────────────────────────────────────────────────────────
-@app.post("/explain")
-def explain(req: ExplainInput):
-    """
-    Returns word-level explanation for why the model made its prediction.
-
-    use_lime=True  → full LIME explanation with highlighted HTML (slower ~2s)
-    use_lime=False → fast TF-IDF top features (instant)
-    """
-    text = req.text
-
-    if len(text.split()) < 5:
-        return {"warning": "Input too short to explain."}
-
-    clean = preprocess(text)
-    ml_label = int(pipeline.predict([clean])[0])
-    probs = pipeline.predict_proba([clean])[0]
-
-    if req.use_lime:
-        logger.info("Generating LIME explanation...")
-        result = get_lime_explanation(text, pipeline)
-        method = "lime"
-    else:
-        logger.info("Generating TF-IDF explanation...")
-        result = get_tfidf_top_features(clean, pipeline)
-        method = "tfidf"
-
-    if result is None:
-        result = get_tfidf_top_features(clean, pipeline)
-        method = "tfidf_fallback"
-
-    return {
-        "prediction": "Real" if ml_label == 1 else "Fake",
-        "fake_probability": round(float(probs[0]) * 100, 2),
-        "real_probability": round(float(probs[1]) * 100, 2),
-        "explanation_method": method,
-        **result,
-    }
-
-
-# ─── /health ─────────────────────────────────────────────────────────────────
-@app.get("/health")
-def health():
-    return {"status": "ok", "version": "3.0"}
+print("\n✅ Training complete.")
+print(f"   Accuracy : {test_accuracy:.4f}")
+print(f"   ROC-AUC  : {roc_auc:.4f}")
+print(f"   CV Score : {cv_scores.mean():.4f} ± {cv_scores.std():.4f}")
+print("\nArtifacts saved in reports/")
