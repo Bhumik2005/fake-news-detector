@@ -1,12 +1,25 @@
+import os
 import re
+import json
 import logging
 import joblib
-import feedparser
-from fastapi import FastAPI
-from pydantic import BaseModel, validator
-from sklearn.metrics.pairwise import cosine_similarity
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
 
-from src.explain import get_lime_explanation, get_tfidf_top_features
+from sklearn.model_selection import train_test_split, StratifiedKFold, cross_val_score
+from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.linear_model import SGDClassifier
+from sklearn.metrics import (
+    accuracy_score,
+    classification_report,
+    confusion_matrix,
+    ConfusionMatrixDisplay,
+    roc_auc_score,
+    roc_curve,
+)
+from sklearn.pipeline import Pipeline
+
 
 # ─── Logging ─────────────────────────────────────────────────────────────────
 logging.basicConfig(
