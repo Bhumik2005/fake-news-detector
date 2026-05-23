@@ -178,6 +178,8 @@ Returns `{ "status": "ok", "version": "3.0" }`.
 
 ---
 
+🌐 **Live API:** https://fake-news-detector-1-lc2z.onrender.com/docs
+
 ## 👨‍💻 Author
 
 **Bhumik Kumta** — built as an ML Engineering portfolio project.
