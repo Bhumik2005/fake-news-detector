@@ -2,63 +2,83 @@ import re
 import logging
 import joblib
 import feedparser
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, Depends
 from pydantic import BaseModel, validator
+from sqlalchemy.orm import Session
+from sqlalchemy import func
 from sklearn.metrics.pairwise import cosine_similarity
 
-# ─── Logging ────────────────────────────────────────────────────────────────
+from src.database import get_db, init_db
+from src.models import Prediction
+from src.explain import get_lime_explanation, get_tfidf_top_features
+
+# ─── Logging ─────────────────────────────────────────────────────────────────
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s | %(levelname)s | %(message)s"
 )
 logger = logging.getLogger(__name__)
 
-app = FastAPI(title="Fake News Detector API", version="2.0")
+app = FastAPI(title="Fake News Detector API", version="4.0")
 
-# ─── Load model ─────────────────────────────────────────────────────────────
+
+@app.on_event("startup")
+def startup():
+    init_db()
+    logger.info("Database tables created.")
+
+
+# ─── Load pipeline ────────────────────────────────────────────────────────────
 try:
-    model = joblib.load("models/model.pkl")
-    vectorizer = joblib.load("models/vectorizer.pkl")
-    logger.info("Model and vectorizer loaded successfully.")
+    pipeline = joblib.load("models/pipeline.pkl")
+    logger.info("Pipeline loaded successfully.")
 except Exception as e:
-    logger.error(f"Failed to load model: {e}")
+    logger.error(f"Failed to load pipeline: {e}")
     raise
 
 
-# ─── Schema ──────────────────────────────────────────────────────────────────
+# ─── Schemas ─────────────────────────────────────────────────────────────────
 class NewsInput(BaseModel):
     text: str
 
     @validator("text")
-    def text_must_not_be_empty(cls, v):
+    def not_empty(cls, v):
         if not v.strip():
             raise ValueError("Input text cannot be empty.")
         return v.strip()
 
 
-# ─── Preprocessing ───────────────────────────────────────────────────────────
+class ExplainInput(BaseModel):
+    text: str
+    use_lime: bool = True
+
+    @validator("text")
+    def not_empty(cls, v):
+        if not v.strip():
+            raise ValueError("Input text cannot be empty.")
+        return v.strip()
+
+
+# ─── Preprocessing ────────────────────────────────────────────────────────────
 def preprocess(text: str) -> str:
-    """Lowercase, remove URLs, strip special chars — must match train.py pipeline."""
     text = text.lower()
-    text = re.sub(r"http\S+|www\S+", "", text)        # remove URLs
-    text = re.sub(r"[^a-z0-9\s]", " ", text)          # remove special chars
-    text = re.sub(r"\s+", " ", text).strip()           # collapse whitespace
+    text = re.sub(r"http\S+|www\S+", "", text)
+    text = re.sub(r"[^a-z0-9\s]", " ", text)
+    text = re.sub(r"\s+", " ", text).strip()
     return text
 
 
-# ─── News fetching ───────────────────────────────────────────────────────────
+# ─── News helpers ─────────────────────────────────────────────────────────────
 def clean_query(text: str) -> str:
-    """Extract a short keyword query from raw input."""
     words = re.sub(r"[^a-z0-9\s]", "", text.lower()).split()
     return " ".join(words[:6])
 
 
 def fetch_related_news(query: str) -> list:
     try:
-        query_encoded = query.replace(" ", "+")
         url = (
             f"https://news.google.com/rss/search"
-            f"?q={query_encoded}&hl=en-IN&gl=IN&ceid=IN:en"
+            f"?q={query.replace(' ', '+')}&hl=en-IN&gl=IN&ceid=IN:en"
         )
         feed = feedparser.parse(url)
         articles = []
@@ -70,148 +90,94 @@ def fetch_related_news(query: str) -> list:
                 "source": entry.get("source", {}).get("title", "Google News"),
                 "publishedAt": entry.get("published", ""),
             })
-        logger.info(f"Fetched {len(articles)} articles for query: '{query}'")
+        logger.info(f"Fetched {len(articles)} articles for: '{query}'")
         return articles
     except Exception as e:
         logger.warning(f"News fetch failed: {e}")
         return []
 
 
-# ─── Similarity ──────────────────────────────────────────────────────────────
-def compute_best_similarity(user_text: str, articles: list) -> tuple[float, dict | None]:
-    """
-    Returns (best_score, best_article).
-    Hybrid: 60% keyword overlap + 40% TF-IDF cosine similarity.
-    """
+def compute_best_similarity(user_text: str, articles: list) -> tuple:
     if not articles:
         return 0.0, None
 
     user_clean = preprocess(user_text)
     user_words = set(re.findall(r"\w+", user_clean))
-    best_score = 0.0
-    best_article = None
+    best_score, best_article = 0.0, None
 
     for article in articles:
-        article_text = preprocess(
-            article["title"] + " " + article["description"]
-        )
+        article_text = preprocess(article["title"] + " " + article["description"])
         article_words = set(re.findall(r"\w+", article_text))
 
-        # Keyword overlap score
-        common = user_words.intersection(article_words)
-        keyword_score = len(common) / (len(user_words) + 1e-9)
-
-        # TF-IDF cosine similarity
-        vecs = vectorizer.transform([user_clean, article_text])
+        keyword_score = len(user_words & article_words) / (len(user_words) + 1e-9)
+        vecs = pipeline.named_steps["tfidf"].transform([user_clean, article_text])
         ml_score = float(cosine_similarity(vecs[0], vecs[1])[0][0])
 
         score = 0.6 * keyword_score + 0.4 * ml_score
-
         if score > best_score:
-            best_score = score
-            best_article = article
+            best_score, best_article = score, article
 
     return best_score, best_article
 
 
-# ─── Fusion logic ────────────────────────────────────────────────────────────
-def fuse_verdict(
-    ml_label: int,
-    ml_fake_prob: float,
-    ml_real_prob: float,
-    similarity: float,
-    has_news: bool,
-) -> tuple[str, str, float]:
-    """
-    Combine ML model prediction + news similarity into one final verdict.
-
-    Weights:
-      - ML confidence contributes 50%
-      - News similarity contributes 50%
-
-    Returns: (verdict, reason, final_confidence)
-    """
-    # ML signal: score from 0 (very fake) to 1 (very real)
-    ml_signal = ml_real_prob  # already a probability
-
-    # News signal: normalise similarity to [0, 1]
+def fuse_verdict(ml_label, ml_fake_prob, ml_real_prob, similarity, has_news):
+    ml_signal = ml_real_prob
     news_signal = min(similarity, 1.0)
 
-    if not has_news:
-        # No news found — rely entirely on ML
-        combined = ml_signal
-        weight_note = "based on model only (no news found)"
-    else:
-        # Weighted fusion
-        combined = 0.5 * ml_signal + 0.5 * news_signal
-        weight_note = "model + news verification"
+    combined = ml_signal if not has_news else 0.5 * ml_signal + 0.5 * news_signal
+    weight_note = "model only (no news)" if not has_news else "model + news"
 
-    # ── Verdict thresholds ────────────────────────────────────────────────────
     if combined >= 0.65:
-        verdict = "Real"
-        reason = f"Verified by {weight_note}: strong evidence this is real."
+        verdict, reason = "Real", f"Strong credibility from {weight_note}."
     elif combined >= 0.40:
-        verdict = "Unverified"
-        reason = f"Mixed signals from {weight_note}. Treat with caution."
+        verdict, reason = "Unverified", f"Mixed signals from {weight_note}."
     else:
-        verdict = "Likely Fake"
-        reason = f"Low credibility score from {weight_note}."
+        verdict, reason = "Likely Fake", f"Low credibility from {weight_note}."
 
-    # Override: if ML is very confident fake AND similarity is low → Fake
     if ml_fake_prob > 0.80 and similarity < 0.25:
         verdict = "Likely Fake"
-        reason = "Model is highly confident this is fake, and no news evidence found."
-
-    # Override: if ML is very confident real AND strong news match → Real
+        reason = "Model highly confident fake; no corroborating news found."
     if ml_real_prob > 0.80 and similarity > 0.55:
         verdict = "Real"
-        reason = "Model is highly confident, strongly corroborated by current news."
+        reason = "Model highly confident real; strongly corroborated by news."
 
     return verdict, reason, round(combined * 100, 2)
 
 
-# ─── Main endpoint ───────────────────────────────────────────────────────────
+# ─── /predict ────────────────────────────────────────────────────────────────
 @app.post("/predict")
-def predict(news: NewsInput):
-    text = news.text  # already validated + stripped by Pydantic
+def predict(news: NewsInput, db: Session = Depends(get_db)):
+    text = news.text
 
-    # Short input warning
-    word_count = len(text.split())
-    if word_count < 5:
-        return {
-            "warning": "Input too short for reliable prediction.",
-            "word_count": word_count,
-        }
-
-    # ── ML prediction ─────────────────────────────────────────────────────────
     clean = preprocess(text)
-    vec = vectorizer.transform([clean])
-    ml_label = int(model.predict(vec)[0])
-    probs = model.predict_proba(vec)[0]
-    ml_fake_prob = float(probs[0])
-    ml_real_prob = float(probs[1])
+    ml_label = int(pipeline.predict([clean])[0])
+    probs = pipeline.predict_proba([clean])[0]
+    ml_fake_prob, ml_real_prob = float(probs[0]), float(probs[1])
 
-    logger.info(
-        f"ML → label={ml_label} | fake={ml_fake_prob:.2f} | real={ml_real_prob:.2f}"
-    )
-
-    # ── News verification ─────────────────────────────────────────────────────
-    query = clean_query(text)
-    articles = fetch_related_news(query)
+    articles = fetch_related_news(clean_query(text))
     similarity, best_article = compute_best_similarity(text, articles)
 
-    logger.info(f"News similarity={similarity:.3f} | articles={len(articles)}")
-
-    # ── Fuse both signals ─────────────────────────────────────────────────────
     verdict, reason, confidence = fuse_verdict(
-        ml_label=ml_label,
-        ml_fake_prob=ml_fake_prob,
-        ml_real_prob=ml_real_prob,
-        similarity=similarity,
-        has_news=len(articles) > 0,
+        ml_label, ml_fake_prob, ml_real_prob, similarity, len(articles) > 0
     )
 
-    logger.info(f"Final verdict={verdict} | confidence={confidence}")
+    # ── Save to database ──────────────────────────────────────────────────────
+    record = Prediction(
+        input_text=text,
+        verdict=verdict,
+        confidence=confidence,
+        ml_label="Real" if ml_label == 1 else "Fake",
+        ml_fake_prob=round(ml_fake_prob * 100, 2),
+        ml_real_prob=round(ml_real_prob * 100, 2),
+        news_similarity=round(similarity * 100, 2),
+        articles_found=len(articles),
+        reason=reason,
+    )
+    db.add(record)
+    db.commit()
+    db.refresh(record)
+
+    logger.info(f"Prediction saved | id={record.id} verdict={verdict}")
 
     return {
         "prediction": verdict,
@@ -231,6 +197,76 @@ def predict(news: NewsInput):
     }
 
 
+# ─── /explain ────────────────────────────────────────────────────────────────
+@app.post("/explain")
+def explain(req: ExplainInput):
+    text = req.text
+    clean = preprocess(text)
+    ml_label = int(pipeline.predict([clean])[0])
+    probs = pipeline.predict_proba([clean])[0]
+
+    if req.use_lime:
+        result = get_lime_explanation(text, pipeline)
+        method = "lime"
+    else:
+        result = get_tfidf_top_features(clean, pipeline)
+        method = "tfidf"
+
+    if result is None:
+        result = get_tfidf_top_features(clean, pipeline)
+        method = "tfidf_fallback"
+
+    return {
+        "prediction": "Real" if ml_label == 1 else "Fake",
+        "fake_probability": round(float(probs[0]) * 100, 2),
+        "real_probability": round(float(probs[1]) * 100, 2),
+        "explanation_method": method,
+        **result,
+    }
+
+
+# ─── /history ────────────────────────────────────────────────────────────────
+@app.get("/history")
+def history(limit: int = 20, db: Session = Depends(get_db)):
+    """Return the last N predictions."""
+    records = (
+        db.query(Prediction)
+        .order_by(Prediction.created_at.desc())
+        .limit(limit)
+        .all()
+    )
+    return [
+        {
+            "id": r.id,
+            "text": r.input_text[:100] + "..." if len(r.input_text) > 100 else r.input_text,
+            "verdict": r.verdict,
+            "confidence": r.confidence,
+            "created_at": r.created_at.isoformat(),
+        }
+        for r in records
+    ]
+
+
+# ─── /stats ──────────────────────────────────────────────────────────────────
+@app.get("/stats")
+def stats(db: Session = Depends(get_db)):
+    """Prediction analytics."""
+    total = db.query(func.count(Prediction.id)).scalar()
+    verdict_counts = (
+        db.query(Prediction.verdict, func.count(Prediction.id))
+        .group_by(Prediction.verdict)
+        .all()
+    )
+    avg_confidence = db.query(func.avg(Prediction.confidence)).scalar()
+
+    return {
+        "total_predictions": total,
+        "verdict_breakdown": {v: c for v, c in verdict_counts},
+        "average_confidence": round(avg_confidence or 0, 2),
+    }
+
+
+# ─── /health ─────────────────────────────────────────────────────────────────
 @app.get("/health")
 def health():
-    return {"status": "ok", "model_loaded": True}
+    return {"status": "ok", "version": "4.0"}

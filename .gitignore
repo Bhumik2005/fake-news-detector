@@ -4,3 +4,4 @@ __pycache__/
 models/
 echo ".env" >> .gitignore
 echo "models/*.pkl" >> .gitignore
+echo "test.db" >> .gitignore

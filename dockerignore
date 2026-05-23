@@ -1,0 +1,11 @@
+ml_env/
+__pycache__/
+*.pyc
+*.pyo
+.git/
+.gitignore
+.env
+*.md
+.pytest_cache/
+tests/
+.github/
