@@ -36,7 +36,7 @@ jobs:
         run: |
           mkdir -p models
           pip install gdown
-          gdown --id $GDRIVE_FILE_ID -O models/pipeline.pkl
+          gdown "https://drive.google.com/uc?id=$GDRIVE_FILE_ID" -O models/pipeline.pklgdown --id $GDRIVE_FILE_ID -O models/pipeline.pkl
 
       - name: Run tests
         env:
