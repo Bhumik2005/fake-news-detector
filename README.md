@@ -1,3 +1,5 @@
+![CI](https://github.com/Bhumik2005/fake-news-detector/actions/workflows/ci.yml/badge.svg)
+
 # 📰 Fake News Detector
 
 An end-to-end Machine Learning system that detects whether a news article is **Fake** or **Real** using NLP, real-time news verification, and explainable AI.
