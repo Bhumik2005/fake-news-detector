@@ -35,16 +35,16 @@ fake-news-detector/
    python -m venv env
    source env/bin/activate  # On Windows: & "env/Scripts/Activate.ps1"
    ```
-   2. Install dependencies
+2. Install dependencies
       ```Bash
          pip install -r requirements.txt
       ```
-   3. Configure API Key
+3. Configure API Key
       Create .streamlit/secrets.toml in the project root:
       ```Ini, TOML
          GEMINI_API_KEY = "your-google-gemini-api-key-here"
       ```
-   4. Run the Streamlit Application
+4. Run the Streamlit Application
       ```Bash
           streamlit run app/streamlit_app.py
       ```
@@ -59,7 +59,7 @@ The model strictly adheres to the following structured verdict categories:
 
 . UNVERIFIABLE - Insufficient live web evidence available to form a definitive verdict.
 
-### 4. Run the Streamlit Application
+ 5. Run the Streamlit Application
 ```bash
 streamlit run app/streamlit_app.py
 ```
