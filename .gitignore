@@ -1,18 +1,25 @@
-ml_env/
-venv/
-.streamlit/secrets.toml
-__pycache__/
-*.pyc
-# Virtual Environments
-ml_env/
+# Environment & Virtualenvs
+.envs/
 venv/
 env/
 ENV/
+env.bak/
+venv.bak/
 
-# Streamlit secrets (Keep your API keys private!)
+# Streamlit Local Secrets (CRITICAL: Keeps your Gemini API Key safe)
 .streamlit/secrets.toml
 
-# Python cache & temporary files
+# Local Databases & Logs
+*.db
+feedback_logs.db
+
+# Python Bytecode & Cache
 __pycache__/
-*.pyc
+*.py[cod]
+*$py.class
 .pytest_cache/
+
+# VS Code Settings & OS Files
+.vscode/
+.DS_Store
+Thumbs.db
