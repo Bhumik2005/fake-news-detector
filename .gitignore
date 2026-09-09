@@ -1,7 +1,18 @@
 ml_env/
+venv/
+.streamlit/secrets.toml
 __pycache__/
 *.pyc
-models/
-echo ".env" >> .gitignore
-echo "models/*.pkl" >> .gitignore
-echo "test.db" >> .gitignore
+# Virtual Environments
+ml_env/
+venv/
+env/
+ENV/
+
+# Streamlit secrets (Keep your API keys private!)
+.streamlit/secrets.toml
+
+# Python cache & temporary files
+__pycache__/
+*.pyc
+.pytest_cache/

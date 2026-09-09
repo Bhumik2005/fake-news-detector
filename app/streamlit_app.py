@@ -1,170 +1,87 @@
 import os
-import streamlit as st
 import requests
-from dotenv import load_dotenv
+import streamlit as st
+from duckduckgo_search import DDGS
+from google import genai
 
-load_dotenv()
+# Page Config
+st.set_page_config(page_title="Global Fact Check Engine", page_icon="🔍", layout="wide")
 
-API_URL = os.getenv("API_URL", "http://localhost:8000") + "/predict"
+st.title("🌐 Global News & Fact-Checking Engine")
+st.caption("Production-grade verification engine using Live Search & AI reasoning.")
 
-# Page config
-st.set_page_config(
-    page_title="Fake News Detector",
-    layout="centered"
-)
+# Get Gemini API key from Streamlit secrets or environment
+GEMINI_API_KEY = st.secrets.get("GEMINI_API_KEY", os.getenv("GEMINI_API_KEY"))
 
-# Title
-st.title("📰 Real-Time Fake News Detector")
-st.write("Enter a news statement or question to verify it using live news sources.")
+# Step 1: Query Google Fact Check API
+def query_factcheck_api(query):
+    url = f"https://factchecktools.googleapis.com/v1alpha1/claims:search?query={query}&key={st.secrets.get('GOOGLE_FACTCHECK_KEY', '')}"
+    try:
+        response = requests.get(url, timeout=5)
+        if response.status_code == 200:
+            data = response.json()
+            return data.get("claims", [])
+    except Exception:
+        pass
+    return []
 
-# Input box
-text = st.text_area("Enter News / Question", height=200)
+# Step 2: Live Web Search
+def search_live_news(query):
+    with DDGS() as ddgs:
+        results = list(ddgs.text(f"{query} news fact check", max_results=5))
+    return results
 
-# Predict button
-if st.button("Predict"):
+# Step 3: LLM Synthesis with Gemini
+def analyze_with_ai(claim, search_results):
+    client = genai.Client(api_key=GEMINI_API_KEY)
+    
+    context = "\n".join([f"- Title: {r['title']}\n  Snippet: {r['body']}\n  URL: {r['href']}" for r in search_results])
+    
+    prompt = f"""
+    You are a professional global news fact-checker. Evaluate the following claim using the provided live search evidence.
 
-    if text.strip() == "":
-        st.warning("⚠️ Please enter some text!")
+    Claim: "{claim}"
 
+    Search Evidence:
+    {context}
+
+    Provide your evaluation in the following structure:
+    1. Verdict: (TRUE, FALSE, PARTIALLY TRUE, or UNVERIFIED)
+    2. Confidence Score: (0-100%)
+    3. Summary Explanation: (3-4 concise sentences detailing why)
+    4. Key Sources Referenced: (Bullet list of URLs)
+    """
+    
+    response = client.models.generate_content(
+        model='gemini-2.5-flash',
+        contents=prompt
+    )
+    return response.text
+
+# User Input Interface
+claim_input = st.text_area("Enter a headline, news claim, or article snippet:", placeholder="e.g., NASA announced discovery of liquid water on Mars today...")
+
+if st.button("Analyze & Verify", type="primary"):
+    if not claim_input.strip():
+        st.warning("Please enter a claim to analyze.")
     else:
-        if len(text.split()) < 5:
-            st.warning("⚠️ Try entering a longer sentence for better accuracy")
-
-        try:
-            response = requests.post(API_URL, json={"text": text})
-
-            if response.status_code == 200:
-                data = response.json()
-
-                if "warning" in data:
-                    st.warning(f"⚠️ {data['warning']}")
-                    st.stop()
-
-                if "prediction" not in data:
-                    st.error("❌ Invalid response from API")
-                    st.write(data)
-
+        with st.spinner("Step 1: Searching global fact-checking databases..."):
+            fact_checks = query_factcheck_api(claim_input)
+            
+        if fact_checks:
+            st.success("Found existing fact-checks from verified organizations:")
+            for claim in fact_checks[:3]:
+                st.write(f"**Claim:** {claim.get('text')}")
+                for review in claim.get('claimReview', []):
+                    st.info(f"**Publisher:** {review.get('publisher', {}).get('name')} | **Rating:** {review.get('textualRating')} | [Read Article]({review.get('url')})")
+        else:
+            with st.spinner("Step 2 & 3: Cross-referencing live global sources with AI..."):
+                search_results = search_live_news(claim_input)
+                if not search_results:
+                    st.error("No live web results found to verify this claim.")
+                elif not GEMINI_API_KEY:
+                    st.error("Please configure GEMINI_API_KEY in `.streamlit/secrets.toml` to enable AI analysis.")
                 else:
-                    st.subheader("Result")
-
-                    if data["prediction"] == "Real":
-                        st.success("✅ Verified News")
-                    elif data["prediction"] == "Likely Fake":
-                        st.error("❌ Likely Fake News")
-                    else:
-                        st.warning("⚠️ Unverified / Developing Story")
-
-                    st.subheader("Match with Real News")
-                    match = data.get("confidence_score", 0)
-                    st.progress(int(match))
-                    st.caption(f"{match:.1f}% confidence score")
-
-                    ml = data.get("ml_details", {})
-                    news = data.get("news_details", {})
-
-                    if ml and news:
-                        col1, col2 = st.columns(2)
-                        with col1:
-                            st.metric("Model says", ml.get("label", "—"))
-                            st.caption(
-                                f"Fake: {ml.get('fake_probability', 0)}% / "
-                                f"Real: {ml.get('real_probability', 0)}%"
-                            )
-                        with col2:
-                            st.metric("News similarity", f"{news.get('similarity_score', 0)}%")
-                            st.caption(f"Articles found: {news.get('articles_found', 0)}")
-
-                    st.subheader("Explanation")
-                    st.info(data.get("reason", "No explanation available"))
-
-                    st.subheader("📰 Related News Articles")
-                    articles = data.get("related_articles", [])
-
-                    if articles:
-                        for article in articles:
-                            st.markdown(f"### {article['title']}")
-                            st.write(f"Source: {article['source']}")
-                            if "publishedAt" in article:
-                                st.caption(f"Published: {article['publishedAt']}")
-                            st.markdown(f"[Read full article]({article['url']})")
-                            st.write("---")
-                    else:
-                        st.write("No relevant news articles found.")
-
-                    # 🔍 EXPLAINABILITY
-                    st.subheader("🔍 Why did the model decide this?")
-
-                    with st.spinner("Generating explanation..."):
-                        explain_response = requests.post(
-                            API_URL.replace("/predict", "/explain"),
-                            json={"text": text, "use_lime": True}
-                        )
-
-                    if explain_response.status_code == 200:
-                        exp = explain_response.json()
-
-                        method = exp.get("explanation_method", "unknown")
-                        st.caption(f"Explanation method: `{method}`")
-
-                        col1, col2 = st.columns(2)
-
-                        with col1:
-                            st.markdown("**🔴 Words pushing toward Fake**")
-                            fake_words = exp.get("top_fake_words", [])
-                            if fake_words:
-                                for item in fake_words:
-                                    weight = item["weight"]
-                                    bar = "█" * min(int(weight * 50), 20)
-                                    st.markdown(
-                                        f"`{item['word']}` &nbsp; "
-                                        f"<span style='color:#dc3545;font-size:11px'>"
-                                        f"{bar} {weight:.3f}</span>",
-                                        unsafe_allow_html=True,
-                                    )
-                            else:
-                                st.caption("No strong fake signals found.")
-
-                        with col2:
-                            st.markdown("**🟢 Words pushing toward Real**")
-                            real_words = exp.get("top_real_words", [])
-                            if real_words:
-                                for item in real_words:
-                                    weight = item["weight"]
-                                    bar = "█" * min(int(weight * 50), 20)
-                                    st.markdown(
-                                        f"`{item['word']}` &nbsp; "
-                                        f"<span style='color:#198754;font-size:11px'>"
-                                        f"{bar} {weight:.3f}</span>",
-                                        unsafe_allow_html=True,
-                                    )
-                            else:
-                                st.caption("No strong real signals found.")
-
-                        highlighted = exp.get("highlighted_html", "")
-                        if highlighted:
-                            st.markdown("**Highlighted input** (hover words for scores)")
-                            st.markdown(
-                                f"<div style='background:#f8f9fa;padding:14px;"
-                                f"border-radius:8px;border:1px solid #dee2e6;"
-                                f"line-height:2;font-size:15px'>"
-                                f"{highlighted}</div>",
-                                unsafe_allow_html=True,
-                            )
-
-                        top_words = exp.get("top_words", [])
-                        if top_words:
-                            st.markdown("**Top TF-IDF features in your input**")
-                            for item in top_words[:8]:
-                                st.markdown(
-                                    f"- `{item['word']}` — score: `{item['score']}`"
-                                )
-                    else:
-                        st.caption("Explanation unavailable.")
-
-            else:
-                st.error(f"❌ API Error: {response.status_code}")
-                st.write(response.text)
-
-        except Exception as e:
-            st.error("❌ Could not connect to backend")
-            st.write(str(e))
+                    verdict = analyze_with_ai(claim_input, search_results)
+                    st.subheader("Analysis Verdict & Evidence")
+                    st.markdown(verdict)
